@@ -1,0 +1,1 @@
+irm https://raw.githubusercontent.com/padinjavier/UNISTALER/main/UNISTALER-GUI.ps1 | iex
