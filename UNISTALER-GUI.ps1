@@ -435,8 +435,11 @@ function Invoke-NormalUninstall($app, [int]$TimeoutMin = 15) {
     $isGuid = $app.Key -match '^\{[0-9A-Fa-f\-]{36}\}$'
     $isMsi = $isGuid -and ($app.WindowsInstaller -eq 1 -or $app.UninstallString -match 'msiexec')
     if ($isMsi) { $exe = 'msiexec.exe'; $argLine = "/x $($app.Key) /qn /norestart" }
-    elseif ($app.QuietUninstallString) { $exe = 'cmd.exe'; $argLine = "/c $($app.QuietUninstallString)" }
-    elseif ($app.UninstallString) { $exe = 'cmd.exe'; $argLine = "/c $($app.UninstallString)" }
+    # IMPORTANTE: cmd /c quita las comillas externas si la cadena empieza con comilla.
+    # Con rutas con espacios ("C:\Program Files\...") eso rompe el comando (codigo 1).
+    # Se envuelve todo en un par extra de comillas: cmd /c ""ruta con espacios" args"
+    elseif ($app.QuietUninstallString) { $exe = 'cmd.exe'; $argLine = '/c "' + $app.QuietUninstallString + '"' }
+    elseif ($app.UninstallString) { $exe = 'cmd.exe'; $argLine = '/c "' + $app.UninstallString + '"' }
     else { Write-Log 'Sin desinstalador registrado'; return $null }
     Write-Log "Ejecutando: $exe $argLine"
     try {
@@ -452,7 +455,25 @@ function Invoke-NormalUninstall($app, [int]$TimeoutMin = 15) {
             }
         }
         $proc.WaitForExit()
-        return $proc.ExitCode
+        $code = $proc.ExitCode
+
+        # Algunos desinstaladores (NSIS, WinRAR, etc.) se copian a TEMP, lanzan esa copia
+        # y terminan enseguida. Se espera mientras la entrada siga en el registro y haya
+        # un proceso de desinstalacion activo (copia en TEMP o dentro de la instalacion).
+        $loc = if ($app.InstallLocation) { ([string]$app.InstallLocation).Trim('"').TrimEnd('\') } else { '' }
+        $sw2 = [Diagnostics.Stopwatch]::StartNew()
+        Wait-Ui 1500
+        while ((Test-Path -LiteralPath $app.PSPath) -and ($sw2.Elapsed.TotalMinutes -lt $TimeoutMin)) {
+            $busy = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                    $_.ExecutablePath -and (
+                        $_.Name -match '^(Au_|unins\d*|uninst\w*|uninstall\w*)\.exe$' -or
+                        ($loc -and $_.ExecutablePath.StartsWith($loc + '\', [StringComparison]::OrdinalIgnoreCase))
+                    )
+                }).Count
+            if ($busy -eq 0) { break }
+            Wait-Ui 700
+        }
+        return $code
     }
     catch { Write-Log "Error al ejecutar desinstalador: $($_.Exception.Message)"; return -1 }
 }
@@ -989,11 +1010,14 @@ function Show-ResultsDialog($App, $Remaining, $RemainingShortcuts, $ExitCode, $N
         $h.Margin = (New-Thick 0 6 0 4)
         $null = $stack.Children.Add($h)
         foreach ($p in $Remaining) {
-            $hasUser = Test-FolderContainsUserFiles $p.Path
+            # La carpeta de instalacion del propio programa contiene imagenes/zip/etc. como
+            # recursos normales: no cuenta como "archivos de usuario" (igual que en el dialogo de rutas).
+            $isInstall = $p.Tipo -in @('Instalacion', 'Programa', 'Ejecutable')
+            $hasUser = (-not $isInstall) -and (Test-FolderContainsUserFiles $p.Path)
             $info = "[{0}]  {1}" -f $p.Tipo, (Format-SizeMB $p.SizeMB)
             $color = '#9A9AA6'
             if ($hasUser) { $info += '   CONTIENE ARCHIVOS DE USUARIO (se pedira confirmacion extra)'; $color = '#EF4444' }
-            $cb = & $mk $p.Path $info $color @{ Path = $p.Path; IsFolder = $true; HasUser = $hasUser } (-not $hasUser)
+            $cb = & $mk $p.Path $info $color @{ Path = $p.Path; IsFolder = $true; HasUser = $hasUser; IsInstall = $isInstall } (-not $hasUser)
             $null = $stack.Children.Add($cb)
             $script:CurrentChecks.Add($cb)
         }
@@ -1149,7 +1173,7 @@ function Invoke-ProcessOneApp($app, [int]$pos, [int]$total) {
         foreach ($t in $items) {
             if ($t.HasUser -and -not $allowUser) { continue }
             Set-Progress $app.Name $sub ("Eliminando: " + $t.Path)
-            if ($t.IsFolder) { $null = Remove-FolderSafe $t.Path -Force:([bool]$t.HasUser) }
+            if ($t.IsFolder) { $null = Remove-FolderSafe $t.Path -Force:([bool]($t.HasUser -or $t.IsInstall)) }
             else { $null = Remove-FileSafe $t.Path }
         }
         if ($res.DeleteReg) {
