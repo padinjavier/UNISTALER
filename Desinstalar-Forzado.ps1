@@ -1,20 +1,21 @@
 <#
-  Desinstalador Seguro con Limpieza Controlada.
+  Desinstalador Seguro con Limpieza Controlada (v3).
   (Archivo solo ASCII a proposito.)
 
-  Flujo:
-    1) Lista los programas instalados (con filtro por texto).
-    2) Intenta la desinstalacion normal (silenciosa si es posible).
-    3) Si sigue instalado, muestra TODAS las rutas asociadas y pregunta
-       una por una si quieres borrarlas.
-    4) Al finalizar, ofrece limpieza opcional de: cache, accesos directos,
-       carpetas vacias, entrada de desinstalacion.
+  Cambios v3:
+    - Shortcuts: valida target del .lnk contra rutas de instalacion; ya no matchea
+      por palabras sueltas (elimina falsos positivos como "Advanced Security.lnk").
+    - Proteccion de archivos: solo extensiones verdaderamente personales.
+      .txt/.json/.xml/.html/.csv ya no cuentan como "archivos de usuario" (son
+      recursos normales de un programa).
+    - Multi-seleccion: "4 6 65" procesa esas apps en cola, una por una.
+    - Resumen final de la cola: OK / parcial / fallido por app.
 
-  PROTECCIONES:
+  PROTECCIONES (sin cambios):
     - NUNCA toca Documentos, Escritorio, Descargas, Imagenes, Videos, Musica.
     - NUNCA borra archivos de usuario (.docx, .xlsx, .pdf, .jpg, .mp4, etc.)
-    - NUNCA toca el registro de Windows (solo la entrada de desinstalacion).
     - NUNCA toca firewall, servicios, tareas programadas ni variables de entorno.
+    - Solo borra la entrada de desinstalacion del registro, con backup previo.
 
   Uso:
      - Doble clic en el .bat lanzador.
@@ -28,11 +29,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# ---------- Auto-elevar a Administrador ----------
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin -and -not $WhatIf) {
     Write-Host "Reiniciando como Administrador..." -ForegroundColor Yellow
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+    if ($WhatIf) { $argList += '-WhatIf' }
     Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
     exit
 }
@@ -82,11 +83,39 @@ function Get-ExeFromString([string]$s) {
     return $null
 }
 
+function Confirm-YesNo([string]$msg) {
+    (Read-Host "$msg [S/N]") -match '^(s|si|y|yes)$'
+}
+
+function Confirm-YesNoOrWhatIf([string]$msg) {
+    if ($WhatIf) {
+        Write-Host "[WhatIf] $msg -> SI (simulacion)" -ForegroundColor Magenta
+        return $true
+    }
+    return Confirm-YesNo $msg
+}
+
+function Wait-EnterOrWhatIf([string]$msg = "`nEnter para continuar") {
+    if ($WhatIf) { return }
+    Read-Host $msg | Out-Null
+}
+
+function Get-FolderSizeMB([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return 0 }
+    $sum = (Get-ChildItem -LiteralPath $path -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Measure-Object Length -Sum).Sum
+    if (-not $sum) { return 0 }
+    [math]::Round(($sum / 1MB), 1)
+}
+
+function Get-CleanAppName([string]$name) {
+    if (-not $name) { return '' }
+    ($name -replace '\s*\(.*?\)', '' -replace '\s+(x64|x86|64-bit|32-bit|v?\d+(\.\d+)+).*$', '').Trim()
+}
+
 # ============================================================
 #  PROTECCION DE DATOS DE USUARIO
 # ============================================================
-
-# Carpetas de usuario que NUNCA se deben tocar (documentos personales)
 function Get-ProtectedUserFolders {
     $folders = @(
         [Environment]::GetFolderPath('MyDocuments'),
@@ -100,7 +129,6 @@ function Get-ProtectedUserFolders {
         (Join-Path $env:USERPROFILE 'Pictures'),
         (Join-Path $env:USERPROFILE 'Music'),
         (Join-Path $env:USERPROFILE 'Videos'),
-        (Join-Path $env:USERPROFILE 'Downloads'),
         (Join-Path $env:USERPROFILE 'OneDrive'),
         (Join-Path $env:USERPROFILE 'Favorites'),
         (Join-Path $env:USERPROFILE 'Contacts'),
@@ -111,15 +139,15 @@ function Get-ProtectedUserFolders {
     $folders
 }
 
-# Extensiones de archivos de usuario que NUNCA se deben borrar
+# Solo extensiones verdaderamente personales. .txt/.json/.xml/.html/.csv NO
+# van aqui: son recursos normales de un programa instalado.
 $script:ProtectedExtensions = @(
-    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.pdf', '.txt', '.rtf', '.odt', '.ods', '.odp',
+    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.pdf', '.rtf', '.odt', '.ods', '.odp',
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.svg', '.heic', '.raw',
     '.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a',
     '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm',
     '.zip', '.rar', '.7z', '.tar', '.gz',
     '.psd', '.ai', '.indd', '.cdr',
-    '.csv', '.json', '.xml', '.html', '.htm',
     '.eml', '.msg', '.pst', '.ost',
     '.db', '.sqlite', '.mdb', '.accdb',
     '.epub', '.mobi', '.azw', '.azw3'
@@ -129,7 +157,6 @@ function Test-ProtectedPath([string]$path) {
     try { $full = [IO.Path]::GetFullPath($path).TrimEnd('\') } catch { return $true }
     if ($full.Length -le 3) { return $true }
 
-    # Rutas del sistema
     $pf86 = ${env:ProgramFiles(x86)}
     if (-not $pf86) { $pf86 = $env:ProgramFiles }
     $protected = @(
@@ -149,17 +176,14 @@ function Test-ProtectedPath([string]$path) {
     if ($full -like (Join-Path $env:ProgramFiles 'Windows*')) { return $true }
     if ($full -like (Join-Path $pf86 'Windows*')) { return $true }
 
-    # Carpetas de documentos de usuario
     $userFolders = Get-ProtectedUserFolders
     foreach ($uf in $userFolders) {
         if ($full -eq $uf) { return $true }
         if ($full -like ($uf + '\*')) { return $true }
     }
-
     return $false
 }
 
-# Verifica si una carpeta contiene archivos de usuario protegidos
 function Test-FolderContainsUserFiles([string]$folder) {
     if (-not (Test-Path -LiteralPath $folder)) { return $false }
     $userFiles = Get-ChildItem -LiteralPath $folder -Recurse -File -Force -ErrorAction SilentlyContinue |
@@ -167,70 +191,70 @@ function Test-FolderContainsUserFiles([string]$folder) {
     return ($userFiles.Count -gt 0)
 }
 
-function Confirm-YesNo([string]$msg) {
-    (Read-Host "$msg [S/N]") -match '^(s|si|y|yes)$'
+# ============================================================
+#  BUSQUEDA DE RUTAS ASOCIADAS
+# ============================================================
+function Get-NameTokens([string]$name, [string]$publisher) {
+    $generic = @('microsoft', 'windows', 'google', 'adobe', 'apple', 'intel', 'nvidia', 'amd', 'oracle',
+        'update', 'runtime', 'redistributable', 'visual', 'studio', 'driver', 'drivers', 'software',
+        'system', 'service', 'services', 'common', 'shared', 'setup', 'install', 'installer', 'program',
+        'programs', 'files', 'application', 'apps', 'data', 'tools', 'client', 'server', 'desktop',
+        'professional', 'standard', 'enterprise', 'home', 'edition', 'plus', 'premium', 'ultimate',
+        'community', 'free', 'language', 'pack',
+        # Tokens que suelen generar falsos positivos en shortcuts del sistema
+        'advanced', 'security', 'scanner', 'monitor', 'manager', 'control', 'center', 'center',
+        'agent', 'helper', 'utility', 'utilities', 'wizard', 'config', 'editor', 'viewer')
+    $tokens = @()
+    if ($name) {
+        $clean = Get-CleanAppName $name
+        $tokens = @($clean -split '\s+' | Where-Object {
+                $_ -match '^[A-Za-z0-9][A-Za-z0-9\-\+\.]*$' -and
+                $_.Length -ge 4 -and
+                $_ -notmatch '^\d+$' -and
+                ($generic -notcontains $_.ToLower())
+            } | Select-Object -First 2)
+    }
+    $tokens | Sort-Object -Unique
 }
 
-function Get-FolderSizeMB([string]$path) {
-    if (-not (Test-Path -LiteralPath $path)) { return 0 }
-    $sum = (Get-ChildItem -LiteralPath $path -Recurse -File -Force -ErrorAction SilentlyContinue |
-        Measure-Object Length -Sum).Sum
-    if (-not $sum) { return 0 }
-    [math]::Round(($sum / 1MB), 1)
-}
-
-# ============================================================
-#  BUSQUEDA DE RUTAS ASOCIADAS AL PROGRAMA
-# ============================================================
 function Get-AppAssociatedPaths($app) {
     $result = New-Object System.Collections.Generic.List[object]
 
-    # 1) Ruta registrada de instalacion
     if ($app.InstallLocation) {
         $loc = $app.InstallLocation.Trim('"').TrimEnd('\')
         if ($loc -and (Test-Path -LiteralPath $loc)) {
-            $result.Add([pscustomobject]@{
-                Path = $loc; Tipo = 'Instalacion'; SizeMB = (Get-FolderSizeMB $loc)
-            })
+            $result.Add([pscustomobject]@{ Path = $loc; Tipo = 'Instalacion'; SizeMB = (Get-FolderSizeMB $loc) })
         }
     }
 
-    # 2) Carpetas derivadas del ejecutable (DisplayIcon / UninstallString)
     foreach ($s in @($app.DisplayIcon, $app.UninstallString, $app.QuietUninstallString)) {
         $exe = Get-ExeFromString $s
         if ($exe) {
             $dir = Split-Path $exe -Parent
             if ($dir -and $dir -notmatch '\\Windows(\\|$)' -and (Test-Path -LiteralPath $dir)) {
                 if (-not ($result | Where-Object { $_.Path -eq $dir })) {
-                    $result.Add([pscustomobject]@{
-                        Path = $dir; Tipo = 'Ejecutable'; SizeMB = (Get-FolderSizeMB $dir)
-                    })
+                    $result.Add([pscustomobject]@{ Path = $dir; Tipo = 'Ejecutable'; SizeMB = (Get-FolderSizeMB $dir) })
                 }
             }
         }
     }
 
-    # 3) Carpetas en Program Files / ProgramData que coincidan con el nombre
     $words = ($app.Name -split '\s+') | Where-Object { $_ -match '^[A-Za-z]{2,}' } | Select-Object -First 2
     if ($words) {
         $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData,
-            (Join-Path $env:LOCALAPPDATA 'Programs')) |
-            Where-Object { $_ -and (Test-Path $_) }
+            (Join-Path $env:LOCALAPPDATA 'Programs')) | Where-Object { $_ -and (Test-Path $_) }
         $pattern = '*' + ($words -join ' ') + '*'
         foreach ($r in $roots) {
             Get-ChildItem $r -Directory -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -like $pattern } |
                 ForEach-Object {
                     if (-not ($result | Where-Object { $_.Path -eq $_.FullName })) {
-                        $result.Add([pscustomobject]@{
-                            Path = $_.FullName; Tipo = 'Programa'; SizeMB = (Get-FolderSizeMB $_.FullName)
-                        })
+                        $result.Add([pscustomobject]@{ Path = $_.FullName; Tipo = 'Programa'; SizeMB = (Get-FolderSizeMB $_.FullName) })
                     }
                 }
         }
     }
 
-    # 4) Carpetas de datos de usuario (APPDATA / LOCALAPPDATA) - SIN tocar Documents/Desktop
     $tokens = Get-NameTokens $app.Name $app.Publisher
     if ($tokens) {
         $dataRoots = @(
@@ -247,20 +271,16 @@ function Get-AppAssociatedPaths($app) {
                 foreach ($c in $candidates) {
                     if (Test-ProtectedPath $c.FullName) { continue }
                     if (-not ($result | Where-Object { $_.Path -eq $c.FullName })) {
-                        $result.Add([pscustomobject]@{
-                            Path = $c.FullName; Tipo = $r.Kind; SizeMB = (Get-FolderSizeMB $c.FullName)
-                        })
+                        $result.Add([pscustomobject]@{ Path = $c.FullName; Tipo = $r.Kind; SizeMB = (Get-FolderSizeMB $c.FullName) })
                     }
                 }
             }
         }
     }
 
-    # 5) Carpetas de cache (temporales, cache, logs) - se ofrecen al final
     if ($tokens) {
         $cachePatterns = @('*cache*', '*temp*', '*tmp*', '*log*')
-        $cacheRoots = @($env:APPDATA, $env:LOCALAPPDATA, $env:ProgramData) |
-            Where-Object { $_ -and (Test-Path $_) }
+        $cacheRoots = @($env:APPDATA, $env:LOCALAPPDATA, $env:ProgramData) | Where-Object { $_ -and (Test-Path $_) }
         foreach ($root in $cacheRoots) {
             foreach ($tok in $tokens) {
                 foreach ($pat in $cachePatterns) {
@@ -269,9 +289,7 @@ function Get-AppAssociatedPaths($app) {
                     foreach ($c in $candidates) {
                         if (Test-ProtectedPath $c.FullName) { continue }
                         if (-not ($result | Where-Object { $_.Path -eq $c.FullName })) {
-                            $result.Add([pscustomobject]@{
-                                Path = $c.FullName; Tipo = 'Cache'; SizeMB = (Get-FolderSizeMB $c.FullName)
-                            })
+                            $result.Add([pscustomobject]@{ Path = $c.FullName; Tipo = 'Cache'; SizeMB = (Get-FolderSizeMB $c.FullName) })
                         }
                     }
                 }
@@ -282,58 +300,83 @@ function Get-AppAssociatedPaths($app) {
     $result | Sort-Object Path -Unique
 }
 
-function Get-NameTokens([string]$name, [string]$publisher) {
-    $generic = @('microsoft', 'windows', 'google', 'adobe', 'apple', 'intel', 'nvidia', 'amd', 'oracle',
-        'update', 'runtime', 'redistributable', 'visual', 'studio', 'driver', 'drivers', 'software',
-        'system', 'service', 'services', 'common', 'shared', 'setup', 'install', 'installer', 'program',
-        'programs', 'files', 'application', 'apps', 'data', 'tools', 'client', 'server', 'desktop',
-        'professional', 'standard', 'enterprise', 'home', 'edition', 'plus', 'premium', 'ultimate',
-        'community', 'free', 'language', 'pack')
-    $tokens = @()
-    if ($name) {
-        $clean = $name -replace '\s*\(.*?\)', '' -replace '\s+(x64|x86|64-bit|32-bit|v?\d+(\.\d+)+).*$', ''
-        $tokens = @($clean -split '\s+' | Where-Object {
-                $_ -match '^[A-Za-z0-9][A-Za-z0-9\-\+\.]*$' -and
-                $_.Length -ge 4 -and
-                $_ -notmatch '^\d+$' -and
-                ($generic -notcontains $_.ToLower())
-            } | Select-Object -First 2)
-    }
-    $tokens | Sort-Object -Unique
-}
+# Fix principal: los shortcuts se validan por TARGET, no por palabras sueltas.
+function Get-Shortcuts($app, $installPaths) {
+    $result = [System.Collections.Generic.List[object]]::new()
 
-# Accesos directos del programa (Escritorio, Menu Inicio, Taskbar)
-function Get-Shortcuts($app) {
-    $result = New-Object System.Collections.Generic.List[object]
-    $tokens = Get-NameTokens $app.Name $app.Publisher
-    if (-not $tokens) { return $result }
+    $fullClean = Get-CleanAppName $app.Name
 
-    $publicDesktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
-    $userDesktop = [Environment]::GetFolderPath('Desktop')
-    $userStart = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
-    $allUsersStart = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'
-    $quickLaunch = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch'
-    $taskbarPinned = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+    # Solo son validas las rutas de instalacion (no datos, no cache)
+    $installOnly = @($installPaths |
+        Where-Object { $_ -and $_.Tipo -in @('Instalacion', 'Programa', 'Ejecutable') } |
+        ForEach-Object { $_.Path.TrimEnd('\').ToLower() })
 
-    $roots = @($publicDesktop, $userDesktop, $userStart, $allUsersStart, $quickLaunch, $taskbarPinned) |
-        Where-Object { $_ -and (Test-Path $_) }
+    if (-not $fullClean -and $installOnly.Count -eq 0) { return $result }
 
-    foreach ($root in $roots) {
-        foreach ($tok in $tokens) {
+    $roots = @(
+        [Environment]::GetFolderPath('CommonDesktopDirectory'),
+        [Environment]::GetFolderPath('Desktop'),
+        (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'),
+        (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'),
+        (Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch'),
+        (Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar')
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    $shell = $null
+    try { $shell = New-Object -ComObject WScript.Shell } catch { }
+
+    try {
+        foreach ($root in $roots) {
             Get-ChildItem -LiteralPath $root -Recurse -Filter '*.lnk' -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -like "*$tok*" } |
                 ForEach-Object {
-                    $result.Add([pscustomobject]@{
-                        Path = $_.FullName; Tipo = 'Acceso directo'
-                    })
+                    $lnk = $_
+                    $matched = $false
+                    $reason = ''
+
+                    # Prioridad 1: el target del .lnk apunta dentro de la carpeta de instalacion
+                    if ($shell -and $installOnly.Count -gt 0) {
+                        try {
+                            $target = $shell.CreateShortcut($lnk.FullName).TargetPath
+                            if ($target) {
+                                $tLower = $target.ToLower()
+                                foreach ($ip in $installOnly) {
+                                    if ($tLower -eq $ip -or $tLower.StartsWith($ip + '\')) {
+                                        $matched = $true
+                                        $reason = 'target-en-instalacion'
+                                        break
+                                    }
+                                }
+                            }
+                        } catch { }
+                    }
+
+                    # Prioridad 2: el nombre del .lnk contiene el nombre completo de la app
+                    if (-not $matched -and $fullClean.Length -ge 5) {
+                        if ($lnk.BaseName -like "*$fullClean*") {
+                            $matched = $true
+                            $reason = 'nombre-completo'
+                        }
+                    }
+
+                    if ($matched) {
+                        $result.Add([pscustomobject]@{
+                            Path = $lnk.FullName
+                            Tipo = 'Acceso directo'
+                            Reason = $reason
+                        })
+                    }
                 }
+        }
+    } finally {
+        if ($shell) {
+            try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null } catch { }
         }
     }
     $result | Sort-Object Path -Unique
 }
 
 # ============================================================
-#  BORRADO SEGURO (CON PROTECCIONES)
+#  BORRADO SEGURO
 # ============================================================
 function Stop-ProcessesInFolder([string]$folder) {
     $prefix = $folder.TrimEnd('\') + '\'
@@ -345,27 +388,26 @@ function Stop-ProcessesInFolder([string]$folder) {
         }
 }
 
-function Remove-FolderSafe([string]$folder) {
+function Remove-FolderSafe([string]$folder, [switch]$SkipUserFilePrompt) {
     if (Test-ProtectedPath $folder) {
-        Write-Host "   RUTA PROTEGIDA (documentos de usuario), se omite: $folder" -ForegroundColor Red
-        return
+        Write-Host "   RUTA PROTEGIDA, se omite: $folder" -ForegroundColor Red
+        return $false
     }
 
-    if (Test-FolderContainsUserFiles $folder) {
-        Write-Host "   ADVERTENCIA: La carpeta contiene archivos de usuario (.docx, .xlsx, .pdf, etc.)" -ForegroundColor Red
+    if (-not $SkipUserFilePrompt -and (Test-FolderContainsUserFiles $folder)) {
+        Write-Host "   ADVERTENCIA: La carpeta contiene archivos de usuario." -ForegroundColor Red
         Write-Host "   Carpeta: $folder" -ForegroundColor Yellow
         $userFiles = Get-ChildItem -LiteralPath $folder -Recurse -File -Force -ErrorAction SilentlyContinue |
             Where-Object { $script:ProtectedExtensions -contains $_.Extension.ToLower() } |
             Select-Object -First 10
-        Write-Host "   Archivos de usuario encontrados (muestra):" -ForegroundColor Yellow
         $userFiles | ForEach-Object { Write-Host "      - $($_.FullName)" -ForegroundColor DarkGray }
         if (-not (Confirm-YesNo "   La carpeta contiene archivos de usuario. Borrar TODO de todas formas?")) {
             Write-Host "   Omitida." -ForegroundColor DarkGray
-            return
+            return $false
         }
     }
 
-    if ($WhatIf) { Write-Host "   [WhatIf] Se borraria carpeta: $folder" -ForegroundColor Cyan; return }
+    if ($WhatIf) { Write-Host "   [WhatIf] Se borraria carpeta: $folder" -ForegroundColor Cyan; return $true }
 
     Stop-ProcessesInFolder $folder
     Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue
@@ -376,21 +418,20 @@ function Remove-FolderSafe([string]$folder) {
     }
     if (Test-Path -LiteralPath $folder) {
         Write-Host "   No se pudo borrar todo: $folder" -ForegroundColor Red
+        return $false
     }
-    else {
-        Write-Host "   Eliminada: $folder" -ForegroundColor Green
-    }
+    Write-Host "   Eliminada: $folder" -ForegroundColor Green
+    return $true
 }
 
 function Remove-FileSafe([string]$file) {
-    if ($WhatIf) { Write-Host "   [WhatIf] Se borraria archivo: $file" -ForegroundColor Cyan; return }
-    if (-not (Test-Path -LiteralPath $file)) { return }
+    if ($WhatIf) { Write-Host "   [WhatIf] Se borraria archivo: $file" -ForegroundColor Cyan; return $true }
+    if (-not (Test-Path -LiteralPath $file)) { return $true }
 
-    # Proteger archivos de usuario
     $ext = [IO.Path]::GetExtension($file).ToLower()
     if ($script:ProtectedExtensions -contains $ext) {
         Write-Host "   ARCHIVO DE USUARIO PROTEGIDO, se omite: $file" -ForegroundColor Red
-        return
+        return $false
     }
 
     Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
@@ -400,10 +441,10 @@ function Remove-FileSafe([string]$file) {
     }
     if (-not (Test-Path -LiteralPath $file)) {
         Write-Host "   Eliminado: $file" -ForegroundColor Green
+        return $true
     }
-    else {
-        Write-Host "   No se pudo borrar: $file" -ForegroundColor Red
-    }
+    Write-Host "   No se pudo borrar: $file" -ForegroundColor Red
+    return $false
 }
 
 function Refresh-Explorer {
@@ -457,91 +498,216 @@ function Invoke-NormalUninstall($app, [int]$TimeoutMin = 15) {
 }
 
 # ============================================================
-#  FLUJO PRINCIPAL DE LIMPIEZA
+#  FASES
 # ============================================================
-function Invoke-ForcedRemoval($app) {
-    Write-Host "`n=== ELIMINACION FORZADA: $($app.Name) ===" -ForegroundColor Red
-    if ($WhatIf) { Write-Host "MODO SIMULACION (no se borrara nada)" -ForegroundColor Magenta }
+function Show-AppPathsDiscovery($app) {
+    Write-Host "`n[1/4] Rutas asociadas a: $($app.Name)" -ForegroundColor Cyan
 
-    # ----- FASE 1: recolectar todas las rutas -----
-    Write-Host "`n[1/3] Buscando TODAS las rutas asociadas al programa..." -ForegroundColor Cyan
     $paths = @(Get-AppAssociatedPaths $app)
-    $shortcuts = @(Get-Shortcuts $app)
+    $shortcuts = @(Get-Shortcuts $app $paths)
 
-    # ----- FASE 2: mostrar resumen -----
-    Write-Host "`n--- RUTAS ENCONTRADAS ---" -ForegroundColor Yellow
     if ($paths.Count -eq 0 -and $shortcuts.Count -eq 0) {
-        Write-Host "No se encontraron rutas asociadas." -ForegroundColor Yellow
+        Write-Host "  No se encontraron rutas asociadas en el disco." -ForegroundColor Yellow
+    }
+    else {
+        if ($paths.Count -gt 0) {
+            Write-Host "`n  Carpetas detectadas ($($paths.Count)):" -ForegroundColor Yellow
+            $i = 1
+            foreach ($p in $paths) {
+                $hasUser = $p.Tipo -notin @('Instalacion', 'Programa', 'Ejecutable') -and (Test-FolderContainsUserFiles $p.Path)
+                $warn = if ($hasUser) { ' [CONTIENE ARCHIVOS DE USUARIO]' } else { '' }
+                $color = if ($hasUser) { 'Red' } else { 'Cyan' }
+                Write-Host ("    {0,2}. [{1}] {2}  ({3} MB){4}" -f $i, $p.Tipo, $p.Path, $p.SizeMB, $warn) -ForegroundColor $color
+                $i++
+            }
+        }
+        if ($shortcuts.Count -gt 0) {
+            Write-Host "`n  Accesos directos detectados ($($shortcuts.Count)):" -ForegroundColor Yellow
+            $i = 1
+            foreach ($s in $shortcuts) {
+                Write-Host ("    {0,2}. {1}  ({2})" -f $i, $s.Path, $s.Reason) -ForegroundColor Cyan
+                $i++
+            }
+        }
+    }
+
+    Write-Host "`n  NOTA: Documentos, Escritorio, Descargas, Imagenes, etc. NUNCA se incluyen." -ForegroundColor Green
+    Write-Host "        Archivos .docx, .xlsx, .pdf, .jpg, .mp4, etc. NUNCA se borran." -ForegroundColor Green
+
+    return [pscustomobject]@{
+        App = $app
+        Paths = $paths
+        Shortcuts = $shortcuts
+    }
+}
+
+function Get-SnapshotStatus($snapshot) {
+    $remaining = @(); $removed = @()
+    foreach ($p in $snapshot.Paths) {
+        if (Test-Path -LiteralPath $p.Path) { $remaining += $p } else { $removed += $p }
+    }
+    $remShort = @(); $removedShort = @()
+    foreach ($s in $snapshot.Shortcuts) {
+        if (Test-Path -LiteralPath $s.Path) { $remShort += $s } else { $removedShort += $s }
+    }
+    [pscustomobject]@{
+        RemainingPaths = $remaining
+        RemovedPaths = $removed
+        RemainingShortcuts = $remShort
+        RemovedShortcuts = $removedShort
+    }
+}
+
+function Invoke-BatchRemoval($status) {
+    $foldersToDelete = @($status.RemainingPaths)
+    $shortcutsToDelete = @($status.RemainingShortcuts)
+
+    if ($foldersToDelete.Count -eq 0 -and $shortcutsToDelete.Count -eq 0) {
+        Write-Host "`n  No quedaron restos. Todo eliminado por el desinstalador." -ForegroundColor Green
         return
     }
 
-    $idx = 1
-    foreach ($p in $paths) {
-        Write-Host ("  {0,2}. [{1}] {2}  ({3} MB)" -f $idx, $p.Tipo, $p.Path, $p.SizeMB) -ForegroundColor Cyan
-        $idx++
-    }
-    foreach ($s in $shortcuts) {
-        Write-Host ("  {0,2}. [Acceso directo] {1}" -f $idx, $s.Path) -ForegroundColor Cyan
-        $idx++
-    }
+    Write-Host "`n[4/4] Restos encontrados despues de la desinstalacion:" -ForegroundColor Yellow
 
-    Write-Host "`nNOTA: Las carpetas de Documentos, Escritorio, Descargas, Imagenes, etc." -ForegroundColor Green
-    Write-Host "      NUNCA se incluyen en esta lista (estan protegidas)." -ForegroundColor Green
-    Write-Host "      Los archivos .docx, .xlsx, .pdf, .jpg, .mp4, etc. NUNCA se borran." -ForegroundColor Green
-
-    # ----- FASE 3: preguntar una por una -----
-    Write-Host "`n[2/3] Preguntando por cada ruta (una por una)..." -ForegroundColor Cyan
-    if ((Read-Host "`nEscribe CONTINUAR para empezar a preguntar") -cne 'CONTINUAR') {
-        Write-Host "Cancelado."; return
+    if ($foldersToDelete.Count -gt 0) {
+        Write-Host "`n  Carpetas que aun existen ($($foldersToDelete.Count)):" -ForegroundColor Cyan
+        foreach ($p in $foldersToDelete) {
+            $hasUser = Test-FolderContainsUserFiles $p.Path
+            $marker = if ($hasUser) { " [CONTIENE ARCHIVOS DE USUARIO]" } else { "" }
+            $color = if ($hasUser) { 'Red' } else { 'Cyan' }
+            Write-Host ("    - [{0}] {1} ({2} MB){3}" -f $p.Tipo, $p.Path, $p.SizeMB, $marker) -ForegroundColor $color
+        }
     }
 
-    foreach ($p in $paths) {
-        if (Confirm-YesNo "`nBorrar carpeta [$($p.Tipo)] '$($p.Path)' ($($p.SizeMB) MB)?") {
-            Remove-FolderSafe $p.Path
+    if ($shortcutsToDelete.Count -gt 0) {
+        Write-Host "`n  Accesos directos que aun existen ($($shortcutsToDelete.Count)):" -ForegroundColor Cyan
+        foreach ($s in $shortcutsToDelete) {
+            Write-Host ("    - {0}" -f $s.Path) -ForegroundColor Cyan
+        }
+    }
+
+    $dangerous = @($foldersToDelete | Where-Object { Test-FolderContainsUserFiles $_.Path })
+    $safe = @($foldersToDelete | Where-Object { -not (Test-FolderContainsUserFiles $_.Path) })
+
+    if ($safe.Count -gt 0) {
+        Write-Host "`n  Carpetas SEGURAS (sin archivos de usuario): $($safe.Count)" -ForegroundColor Green
+        if (Confirm-YesNoOrWhatIf "  Borrar TODAS las carpetas seguras de una vez?") {
+            foreach ($p in $safe) { Remove-FolderSafe $p.Path -SkipUserFilePrompt | Out-Null }
         }
         else {
-            Write-Host "   Omitida: $($p.Path)" -ForegroundColor DarkGray
+            Write-Host "  Omitidas $($safe.Count) carpetas seguras." -ForegroundColor DarkGray
         }
     }
 
-    foreach ($s in $shortcuts) {
-        if (Confirm-YesNo "`nBorrar acceso directo '$($s.Path)'?") {
-            Remove-FileSafe $s.Path
-        }
-        else {
-            Write-Host "   Omitido: $($s.Path)" -ForegroundColor DarkGray
-        }
-    }
-
-    # ----- FASE 4: limpieza final opcional -----
-    Write-Host "`n[3/3] Limpieza final opcional..." -ForegroundColor Cyan
-    if (Confirm-YesNo "`nQuieres borrar la entrada de desinstalacion del registro (para que desaparezca de la lista de programas)?") {
-        if ($WhatIf) {
-            Write-Host "   [WhatIf] Se borraria clave: $($app.PSPath)" -ForegroundColor Cyan
-        }
-        else {
-            try {
-                $safeName = ($app.Key -replace '[\\/:*?"<>|]', '_')
-                $backup = Join-Path $env:TEMP ("RegBackup_{0}_{1}.reg" -f (Get-Date -Format 'yyyyMMdd_HHmmss'), $safeName)
-                $native = $app.PSPath -replace '^Microsoft\.PowerShell\.Core\\Registry::', '' -replace '^Registry::', ''
-                $native = $native -replace '^HKCU:\\?', 'HKEY_CURRENT_USER\' -replace '^HKLM:\\?', 'HKEY_LOCAL_MACHINE\'
-                & reg.exe export $native $backup /y 2>&1 | Out-Null
-                Remove-Item -LiteralPath $app.PSPath -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Host "   Entrada de desinstalacion eliminada (backup: $backup)" -ForegroundColor Green
+    if ($dangerous.Count -gt 0) {
+        Write-Host "`n  ATENCION: $($dangerous.Count) carpeta(s) contienen archivos de usuario." -ForegroundColor Red
+        Write-Host "  Debes confirmar cada una individualmente." -ForegroundColor Red
+        foreach ($p in $dangerous) {
+            if (Confirm-YesNoOrWhatIf "  Borrar TODA la carpeta '$($p.Path)' (contiene archivos de usuario)?") {
+                Remove-FolderSafe $p.Path | Out-Null
             }
-            catch {
-                Write-Host "   No se pudo borrar la entrada: $($_.Exception.Message)" -ForegroundColor Red
+            else {
+                Write-Host "  Omitida: $($p.Path)" -ForegroundColor DarkGray
             }
         }
     }
-    else {
-        Write-Host "   Omitida. El programa seguira apareciendo en la lista." -ForegroundColor DarkGray
+
+    if ($shortcutsToDelete.Count -gt 0) {
+        if (Confirm-YesNoOrWhatIf "  Borrar los $($shortcutsToDelete.Count) accesos directos restantes?") {
+            foreach ($s in $shortcutsToDelete) { Remove-FileSafe $s.Path | Out-Null }
+        }
+    }
+}
+
+function Remove-RegistryEntryWithBackup($app) {
+    if (-not (Test-Path -LiteralPath $app.PSPath)) { return $true }
+    Write-Host "`n  La entrada del programa sigue en el registro de Windows." -ForegroundColor Yellow
+    if (-not (Confirm-YesNoOrWhatIf "  Borrar la entrada de desinstalacion (con backup previo)?")) {
+        Write-Host "  Omitida. El programa seguira apareciendo en la lista." -ForegroundColor DarkGray
+        return $false
+    }
+    if ($WhatIf) {
+        Write-Host "   [WhatIf] Se borraria clave: $($app.PSPath)" -ForegroundColor Cyan
+        return $true
+    }
+    try {
+        $safeName = ($app.Key -replace '[\\/:*?"<>|]', '_')
+        $backup = Join-Path $env:TEMP ("RegBackup_{0}_{1}.reg" -f (Get-Date -Format 'yyyyMMdd_HHmmss'), $safeName)
+        $native = $app.PSPath -replace '^Microsoft\.PowerShell\.Core\\Registry::', '' -replace '^Registry::', ''
+        $native = $native -replace '^HKCU:\\?', 'HKEY_CURRENT_USER\' -replace '^HKLM:\\?', 'HKEY_LOCAL_MACHINE\'
+        & reg.exe export $native $backup /y 2>&1 | Out-Null
+        Remove-Item -LiteralPath $app.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "   Entrada eliminada (backup: $backup)" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "   No se pudo borrar la entrada: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+# ============================================================
+#  PROCESAMIENTO DE UNA APP (devuelve veredicto)
+# ============================================================
+function Invoke-ProcessOneApp($target) {
+    Write-Host "`n=== PROCESANDO: $($target.Name) $($target.Version) ===" -ForegroundColor Yellow
+    if ($target.InstallLocation) { Write-Host "Ruta registrada: $($target.InstallLocation)" }
+    if ($target.Publisher) { Write-Host "Editor: $($target.Publisher)" }
+
+    $snapshot = Show-AppPathsDiscovery $target
+
+    Write-Host "`n[2/4] Desinstalacion normal" -ForegroundColor Cyan
+    if (-not (Confirm-YesNoOrWhatIf "`nProceder con la desinstalacion normal?")) {
+        Write-Host "Cancelado." -ForegroundColor DarkGray
+        return 'Cancelado'
     }
 
-    # Refrescar Explorer
+    $exitCode = Invoke-NormalUninstall $target
+    if ($exitCode -ne $null -and $exitCode -ne 0) {
+        Write-Host "`n  ADVERTENCIA: codigo de salida $exitCode. Posible error del instalador (locale)." -ForegroundColor Yellow
+    }
+
+    if (-not $WhatIf) { Start-Sleep -Seconds 3 }
+
+    Write-Host "`n[3/4] Verificando estado despues de la desinstalacion..." -ForegroundColor Cyan
+    $status = Get-SnapshotStatus $snapshot
+
+    if ($status.RemovedPaths.Count -gt 0) {
+        Write-Host "`n  Carpetas eliminadas por el desinstalador ($($status.RemovedPaths.Count)):" -ForegroundColor Green
+        foreach ($p in $status.RemovedPaths) { Write-Host "    OK $($p.Path)" -ForegroundColor Green }
+    }
+    if ($status.RemovedShortcuts.Count -gt 0) {
+        Write-Host "`n  Accesos directos eliminados ($($status.RemovedShortcuts.Count)):" -ForegroundColor Green
+        foreach ($s in $status.RemovedShortcuts) { Write-Host "    OK $($s.Path)" -ForegroundColor Green }
+    }
+
+    $regStillThere = Test-Path -LiteralPath $target.PSPath
+
+    if ($status.RemainingPaths.Count -eq 0 -and $status.RemainingShortcuts.Count -eq 0 -and -not $regStillThere) {
+        Write-Host "`n  DESINSTALACION COMPLETA: $($target.Name)" -ForegroundColor Green
+        return 'Completo'
+    }
+
+    Write-Host "`n  Restos detectados. Se ofrecera eliminarlos." -ForegroundColor Yellow
+    Invoke-BatchRemoval $status
+    if ($regStillThere) { $null = Remove-RegistryEntryWithBackup $target }
     Refresh-Explorer
 
-    Write-Host "`n=== LIMPIEZA COMPLETADA PARA: $($app.Name) ===" -ForegroundColor Green
+    $finalReg = Test-Path -LiteralPath $target.PSPath
+    $finalPaths = @($snapshot.Paths | Where-Object { Test-Path -LiteralPath $_.Path })
+    $finalShortcuts = @($snapshot.Shortcuts | Where-Object { Test-Path -LiteralPath $_.Path })
+
+    if (-not $finalReg -and $finalPaths.Count -eq 0 -and $finalShortcuts.Count -eq 0) {
+        Write-Host "`n  VEREDICTO: DESINSTALADO COMPLETAMENTE" -ForegroundColor Green
+        return 'Completo'
+    }
+    elseif (-not $finalReg) {
+        Write-Host "`n  VEREDICTO: DESINSTALADO (quedan $($finalPaths.Count) carpetas y $($finalShortcuts.Count) accesos conservados)" -ForegroundColor Yellow
+        return 'Parcial'
+    }
+    else {
+        Write-Host "`n  VEREDICTO: PARCIAL - entrada del registro aun presente" -ForegroundColor Red
+        return 'Fallido'
+    }
 }
 
 # ============================================================
@@ -565,48 +731,71 @@ while ($true) {
         Write-Host ("{0,3}. {1}  {2}  [{3}]" -f ($i + 1), $a.Name, $a.Version, $a.Publisher)
     }
 
-    $in = Read-Host "`nNumero para desinstalar | texto para filtrar | vacio = quitar filtro | Q = salir"
+    $in = Read-Host "`nNumero(s) para desinstalar (ej: 4 6 65) | texto para filtrar | vacio = quitar filtro | Q = salir"
     if ($in -match '^(q|salir)$') { break }
     if ([string]::IsNullOrWhiteSpace($in)) { $filter = ''; continue }
-    if ($in -notmatch '^\d+$') { $filter = $in; continue }
 
-    $n = [int]$in
-    if ($n -lt 1 -or $n -gt $view.Count) {
-        Write-Host "Numero fuera de rango." -ForegroundColor Red
-        Start-Sleep 1
-        continue
-    }
-    $target = $view[$n - 1]
+    $tokens = @($in -split '\s+' | Where-Object { $_ })
+    $allNumbers = ($tokens.Count -gt 0) -and (@($tokens | Where-Object { $_ -notmatch '^\d+$' }).Count -eq 0)
 
-    Write-Host "`nSeleccionado: $($target.Name) $($target.Version)" -ForegroundColor Yellow
-    if ($target.InstallLocation) { Write-Host "Ruta registrada: $($target.InstallLocation)" }
-    if (-not (Confirm-YesNo "Desinstalar este programa?")) { continue }
-
-    # 1) Desinstalacion normal
-    $null = Invoke-NormalUninstall $target
-
-    # 2) Verificar si desaparecio del registro
-    Start-Sleep -Seconds 2
-    $still = Test-Path -LiteralPath $target.PSPath
-    if (-not $still) {
-        Write-Host "`nDesinstalado correctamente." -ForegroundColor Green
-        Write-Host "`nQuieres revisar si quedaron restos (carpetas, accesos directos)?" -ForegroundColor Yellow
-        if (Confirm-YesNo "Revisar y limpiar restos opcionales?") {
-            Invoke-ForcedRemoval $target
+    # ---- Multi-seleccion: cola de apps ----
+    if ($allNumbers) {
+        $queue = [System.Collections.Generic.List[object]]::new()
+        foreach ($tok in $tokens) {
+            $idx = [int]$tok
+            if ($idx -ge 1 -and $idx -le $view.Count) {
+                $queue.Add($view[$idx - 1])
+            } else {
+                Write-Host "Numero fuera de rango: $idx (1..$($view.Count))" -ForegroundColor Yellow
+            }
         }
+        if ($queue.Count -eq 0) { Wait-EnterOrWhatIf; continue }
+
+        Write-Host "`nCola de desinstalacion ($($queue.Count) apps, en este orden):" -ForegroundColor Cyan
+        $i = 1
+        foreach ($q in $queue) {
+            Write-Host ("  {0}. {1}" -f $i, $q.Name) -ForegroundColor Cyan
+            $i++
+        }
+        if (-not (Confirm-YesNoOrWhatIf "`nProcesar esta cola?")) { continue }
+
+        $results = [System.Collections.Generic.List[object]]::new()
+        $qIdx = 0
+        foreach ($target in $queue) {
+            $qIdx++
+            Clear-Host
+            Write-Host ("=== APP $qIdx de $($queue.Count) ===") -ForegroundColor Magenta
+            $verdict = Invoke-ProcessOneApp $target
+            $results.Add([pscustomobject]@{ App = $target.Name; Result = $verdict })
+            Wait-EnterOrWhatIf "`nEnter para pasar a la siguiente app..."
+        }
+
+        # Resumen final de la cola
+        Clear-Host
+        Write-Host "`n=== RESUMEN DE LA COLA ===" -ForegroundColor Cyan
+        $ok = @($results | Where-Object { $_.Result -eq 'Completo' }).Count
+        $parcial = @($results | Where-Object { $_.Result -eq 'Parcial' }).Count
+        $fallido = @($results | Where-Object { $_.Result -eq 'Fallido' }).Count
+        $cancel = @($results | Where-Object { $_.Result -eq 'Cancelado' }).Count
+        Write-Host ("  Completos: {0}" -f $ok) -ForegroundColor Green
+        Write-Host ("  Parciales: {0}" -f $parcial) -ForegroundColor Yellow
+        Write-Host ("  Fallidos:  {0}" -f $fallido) -ForegroundColor Red
+        Write-Host ("  Cancelados:{0}" -f $cancel) -ForegroundColor DarkGray
+        Write-Host "`nDetalle:" -ForegroundColor Cyan
+        foreach ($r in $results) {
+            $color = switch ($r.Result) {
+                'Completo' { 'Green' }; 'Parcial' { 'Yellow' }; 'Fallido' { 'Red' }; default { 'DarkGray' }
+            }
+            Write-Host ("  [{0,-9}] {1}" -f $r.Result, $r.App) -ForegroundColor $color
+        }
+
         $all = Get-InstalledApps
-        Read-Host "Enter para continuar" | Out-Null
+        Wait-EnterOrWhatIf
         continue
     }
 
-    # 3) Forzado
-    Write-Host "`nEl programa sigue registrado como instalado." -ForegroundColor Red
-    if (Confirm-YesNo "Intentar eliminacion forzada (mostrar rutas y preguntar una por una)?") {
-        Invoke-ForcedRemoval $target
-    }
-
-    $all = Get-InstalledApps
-    Read-Host "`nEnter para continuar" | Out-Null
+    # ---- Texto: filtrar ----
+    $filter = $in
 }
 
 Write-Host "`nLog guardado en: $LogFile" -ForegroundColor DarkGray
