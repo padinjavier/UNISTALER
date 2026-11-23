@@ -2,15 +2,11 @@
   Desinstalador APB - Version con UI (WPF, modo noche).  (Archivo solo ASCII a proposito.)
   Reutiliza la logica segura del v3.
 
-  NOVEDADES UI:
-    - Lista con icono real de cada app, version, editor y tamano.
-      El tamano se calcula en segundo plano (la ventana nunca se congela).
-    - Busqueda en vivo, orden por Nombre / Tamano (clic en el encabezado).
-    - Multi-seleccion con checkboxes (clic en cualquier parte de la fila).
-      La cola respeta el orden en que marcaste las apps.
-    - Dialogos propios oscuros: confirmar cola, rutas detectadas, restos a borrar
-      (con checkboxes), progreso y resumen final, todos con botones Aceptar.
-    - El desinstalador corre sin bloquear la ventana.
+  NOVEDADES v4:
+    - Si una carpeta no se puede borrar porque un proceso la esta usando,
+      se detecta el proceso, se te pregunta, y si aceptas se cierra y se reintenta.
+    - Flujo secuencial estricto: App1 -> (exito o limpieza manual) -> App2.
+    - Dialogo de error de borrado con opcion de forzar cierre de procesos.
 
   PROTECCIONES (identicas al v3):
     - NUNCA toca Documentos, Escritorio, Descargas, Imagenes, Videos, Musica.
@@ -363,22 +359,79 @@ function Stop-ProcessesInFolder([string]$folder) {
         ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
 }
 
+# ============================================================
+#  NUEVAS FUNCIONES PARA MANEJO DE BLOQUEOS
+# ============================================================
+function Get-BlockingProcesses([string]$folder) {
+    $prefix = $folder.TrimEnd('\') + '\'
+    $procs = @()
+    try {
+        $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+        }
+    } catch {}
+    return $procs
+}
+
+function Stop-BlockingProcesses($procs) {
+    foreach ($p in $procs) {
+        try {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+            Write-Log "Proceso cerrado: $($p.Name) (PID: $($p.ProcessId))"
+        } catch {
+            Write-Log "No se pudo cerrar el proceso $($p.Name): $_"
+        }
+    }
+}
+
 function Remove-FolderSafe([string]$folder, [bool]$Force = $false) {
     if (Test-ProtectedPath $folder) { Write-Log "PROTEGIDA, omitida: $folder"; return $false }
     if ((-not $Force) -and (Test-FolderContainsUserFiles $folder)) { Write-Log "Con archivos de usuario, omitida: $folder"; return $false }
-    Stop-ProcessesInFolder $folder
-    # Borrado directo y permanente: rd /s /q
+
+    # 1. Intento normal (silencioso)
     $null = & cmd.exe /c "rd /s /q `"$folder`"" 2>&1
-    if (-not (Wait-PathGone $folder 3)) {
-        # Si algo bloquea o no hay permisos: tomar propiedad, dar control total y reintentar
+    if (Wait-PathGone $folder 2) {
+        Write-Log "Carpeta eliminada (normal): $folder"
+        return $true
+    }
+
+    # 2. Si falló, buscar procesos bloqueantes
+    $blockers = Get-BlockingProcesses $folder
+    if ($blockers.Count -gt 0) {
+        $names = ($blockers | Select-Object -ExpandProperty Name -Unique) -join ', '
+        $msg = "La carpeta no se pudo borrar porque esta en uso por:`n`n$names`n`n¿Deseas cerrar estos procesos para continuar con la eliminacion?"
+        
+        $choice = Show-Confirm 'Archivos en uso' $msg 'Si, cerrar y borrar' 'No, omitir carpeta' 'warn'
+        
+        if ($choice) {
+            Set-Progress $folder '' 'Cerrando procesos...'
+            Stop-BlockingProcesses $blockers
+            Wait-Ui 1000
+            Close-Progress
+            
+            $null = & cmd.exe /c "rd /s /q `"$folder`"" 2>&1
+            if (Wait-PathGone $folder 5) {
+                Write-Log "Carpeta eliminada (tras cerrar procesos): $folder"
+                return $true
+            }
+        } else {
+            Write-Log "Usuario omitio cerrar procesos para: $folder"
+            return $false
+        }
+    }
+
+    # 3. Intento forzado (takeown/icacls)
+    if (Test-Path -LiteralPath $folder) {
         Stop-ProcessesInFolder $folder
         $null = & takeown.exe /f $folder /r /d s 2>&1
         $null = & icacls.exe $folder /grant "*S-1-5-32-544:(OI)(CI)F" /t /c /q 2>&1
         $null = & cmd.exe /c "rd /s /q `"$folder`"" 2>&1
         $null = Wait-PathGone $folder 5
     }
+
     $ok = -not (Test-Path -LiteralPath $folder)
-    if ($ok) { Write-Log "Carpeta eliminada: $folder" } else { Write-Log "Carpeta NO se pudo borrar (en uso?): $folder" }
+    if ($ok) { Write-Log "Carpeta eliminada (forzado): $folder" } 
+    else { Write-Log "Carpeta NO se pudo borrar definitivamente: $folder" }
     return $ok
 }
 
@@ -435,16 +488,12 @@ function Wait-Ui([int]$Ms) {
     while ($sw.ElapsedMilliseconds -lt $Ms) { Invoke-UiPump; Start-Sleep -Milliseconds 50 }
 }
 
-# Espera (sin congelar la UI) a que una ruta desaparezca. Devuelve $true si ya no existe.
 function Wait-PathGone([string]$Path, [int]$Sec = 5) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ((Test-Path -LiteralPath $Path) -and $sw.Elapsed.TotalSeconds -lt $Sec) { Wait-Ui 250 }
     return (-not (Test-Path -LiteralPath $Path))
 }
 
-# Revalida varias veces despues de desinstalar: Windows/el desinstalador pueden tardar unos
-# segundos en terminar de borrar. Sale en cuanto todo desaparece, o cuando el estado lleva
-# $StableSec segundos sin cambiar, o al llegar a $MaxSec.
 function Wait-SnapshotSettled($snap, $app, [string]$sub, [int]$MaxSec = 30, [int]$StableSec = 6) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $lastKey = ''
@@ -469,9 +518,6 @@ function Invoke-NormalUninstall($app, [int]$TimeoutMin = 15) {
     $isGuid = $app.Key -match '^\{[0-9A-Fa-f\-]{36}\}$'
     $isMsi = $isGuid -and ($app.WindowsInstaller -eq 1 -or $app.UninstallString -match 'msiexec')
     if ($isMsi) { $exe = 'msiexec.exe'; $argLine = "/x $($app.Key) /qn /norestart" }
-    # IMPORTANTE: cmd /c quita las comillas externas si la cadena empieza con comilla.
-    # Con rutas con espacios ("C:\Program Files\...") eso rompe el comando (codigo 1).
-    # Se envuelve todo en un par extra de comillas: cmd /c ""ruta con espacios" args"
     elseif ($app.QuietUninstallString) { $exe = 'cmd.exe'; $argLine = '/c "' + $app.QuietUninstallString + '"' }
     elseif ($app.UninstallString) { $exe = 'cmd.exe'; $argLine = '/c "' + $app.UninstallString + '"' }
     else { Write-Log 'Sin desinstalador registrado'; return $null }
@@ -491,9 +537,6 @@ function Invoke-NormalUninstall($app, [int]$TimeoutMin = 15) {
         $proc.WaitForExit()
         $code = $proc.ExitCode
 
-        # Algunos desinstaladores (NSIS, WinRAR, etc.) se copian a TEMP, lanzan esa copia
-        # y terminan enseguida. Se espera mientras la entrada siga en el registro y haya
-        # un proceso de desinstalacion activo (copia en TEMP o dentro de la instalacion).
         $loc = if ($app.InstallLocation) { ([string]$app.InstallLocation).Trim('"').TrimEnd('\') } else { '' }
         $sw2 = [Diagnostics.Stopwatch]::StartNew()
         Wait-Ui 1500
@@ -790,7 +833,7 @@ $script:DialogXaml = @'
 '@
 
 function New-Dialog {
-    param([string]$Title, [string]$Subtitle = '', [double]$Width = 540, [double]$Height = 260, [string]$Kind = 'info', [switch]$NoEsc)
+    param([string]$Title = '', [string]$Subtitle = '', [double]$Width = 540, [double]$Height = 260, [string]$Kind = 'info', [switch]$NoEsc)
     $w = [System.Windows.Markup.XamlReader]::Parse($script:DialogXaml)
     $w.Width = $Width + 32
     $w.Height = $Height + 32
@@ -1004,8 +1047,6 @@ function Show-AppPathsDialog($App, $Paths, $Shortcuts) {
 }
 
 # ---------- Dialogo de resultados / restos ----------
-# Vuelve a comprobar en disco/registro: oculta lo que ya no existe y, si no queda nada,
-# convierte el dialogo en un simple "Aceptar".
 function Update-ResultsLive {
     $left = 0
     foreach ($c in $script:CurrentChecks) {
@@ -1079,8 +1120,6 @@ function Show-ResultsDialog($App, $Remaining, $RemainingShortcuts, $ExitCode, $N
         $h.Margin = (New-Thick 0 6 0 4)
         $null = $stack.Children.Add($h)
         foreach ($p in $Remaining) {
-            # La carpeta de instalacion del propio programa contiene imagenes/zip/etc. como
-            # recursos normales: no cuenta como "archivos de usuario" (igual que en el dialogo de rutas).
             $isInstall = $p.Tipo -in @('Instalacion', 'Programa', 'Ejecutable')
             $hasUser = (-not $isInstall) -and (Test-FolderContainsUserFiles $p.Path)
             $info = "[{0}]  {1}" -f $p.Tipo, (Format-SizeMB $p.SizeMB)
@@ -1125,7 +1164,6 @@ function Show-ResultsDialog($App, $Remaining, $RemainingShortcuts, $ExitCode, $N
     $script:BtnResSkip = Add-DlgButton $d 'No borrar nada' 'BtnSecondary' 'Skip'
     $script:BtnResDel = Add-DlgButton $d 'Borrar seleccionados' 'BtnDanger' 'Delete' -Default
 
-    # Revalidacion automatica mientras el dialogo esta abierto
     $script:ResTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:ResTimer.Interval = [TimeSpan]::FromMilliseconds(1500)
     $script:ResTimer.Add_Tick({ try { Update-ResultsLive } catch {} })
@@ -1259,6 +1297,13 @@ function Invoke-ProcessOneApp($app, [int]$pos, [int]$total) {
         }
         $script:ShellDirty = $true
         Close-Progress
+        
+        # Verificacion final post-borrado
+        $stillThere = @($items | Where-Object { Test-Path -LiteralPath $_.Path })
+        if ($stillThere.Count -gt 0) {
+            $errList = ($stillThere | ForEach-Object { $_.Path }) -join "`n"
+            Show-Message 'Aviso de limpieza' "Algunas carpetas no se pudieron borrar (posiblemente en uso por el sistema):`n`n$errList" 'warn'
+        }
     }
 
     $finalReg = Test-Path -LiteralPath $app.PSPath
